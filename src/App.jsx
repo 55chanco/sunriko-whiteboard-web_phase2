@@ -1,0 +1,964 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { db } from "./firebase";
+import {
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  getDocs,
+  query,
+  runTransaction,
+  updateDoc,
+  where,
+} from "firebase/firestore";
+import { DndContext, useDraggable, useDroppable } from "@dnd-kit/core";
+
+function getLocalDateKey(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function getWeekStartMonday(d) {
+  const x = new Date(d);
+  const day = x.getDay();
+  x.setDate(x.getDate() + (day === 0 ? -6 : 1 - day));
+  return x;
+}
+
+function makeDays(baseDate, mode) {
+  if (mode === "month") {
+    const first = new Date(baseDate.getFullYear(), baseDate.getMonth(), 1);
+    const start = new Date(first);
+    start.setDate(1 - ((first.getDay() + 6) % 7));
+    return Array.from({ length: 42 }).map((_, i) => {
+      const d = new Date(start);
+      d.setDate(start.getDate() + i);
+      return getLocalDateKey(d);
+    });
+  }
+
+  const len = mode === "week" ? 7 : 14;
+  const start = getWeekStartMonday(baseDate);
+  return Array.from({ length: len }).map((_, i) => {
+    const d = new Date(start);
+    d.setDate(start.getDate() + i);
+    return getLocalDateKey(d);
+  });
+}
+
+function nowTime() {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+function roundTimeTo5(v) {
+  if (!v || !/^\d{2}:\d{2}$/.test(v)) return "";
+  const [hh, mm] = v.split(":").map(Number);
+  const total = hh * 60 + mm;
+  const rounded = Math.round(total / 5) * 5;
+  const h = Math.floor(rounded / 60) % 24;
+  const m = rounded % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function phaseColor(phaseType) {
+  const t = String(phaseType || "").toLowerCase();
+  if (t === "green") return "#22c55e";
+  if (t === "blue") return "#3b82f6";
+  if (t === "yellow") return "#eab308";
+  if (t === "red") return "#ef4444";
+  return "#9ca3af";
+}
+
+function normalizeMaster(x) {
+  return {
+    ...x,
+    id: x.id,
+    name: x.name ?? x.site_name ?? x.workerName ?? x.vehicle_number ?? "",
+    site_number: x.site_number ?? x.siteNumber ?? "",
+    customer_name: x.customer_name ?? x.client_name ?? x.clientName ?? "",
+    site_name: x.site_name ?? x.siteName ?? x.name ?? "",
+    address: x.address ?? "",
+    memo: x.memo ?? "",
+    has_safety_docs: x.has_safety_docs ?? x.hasSafetyDocs ?? false,
+    vehicle_code: x.vehicle_code ?? x.vehicleCode ?? "",
+    plateNo: x.plateNo ?? "",
+    etcNo: x.etcNo ?? x.etc_no ?? "",
+    owner: x.owner ?? "",
+    type: x.type ?? x.vehicle_type ?? x.vehicleType ?? "",
+    worker_code: x.worker_code ?? x.workerCode ?? "",
+    active: x.active !== false,
+  };
+}
+
+function normalizeAssignment(a) {
+  return {
+    ...a,
+    team_id: a.team_id ?? a.teamId ?? "",
+    date: a.date ?? "",
+    worker_id: a.worker_id ?? a.workerId ?? "",
+    truck_id: a.truck_id ?? a.vehicle_id ?? a.truckId ?? "",
+    site_id: a.site_id ?? a.siteId ?? "",
+    site_order: Number(a.site_order ?? a.siteOrder ?? 999999),
+    planned_in: a.planned_in ?? a.plannedIn ?? "",
+    actual_in: a.actual_in ?? a.actualIn ?? "",
+    actual_out: a.actual_out ?? a.actualOut ?? "",
+    status: a.status ?? "unset",
+    done_at: a.done_at ?? a.doneAt ?? "",
+  };
+}
+
+function DraggableChip({ id, children, style, title }) {
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id });
+  return (
+    <button
+      ref={setNodeRef}
+      type="button"
+      {...attributes}
+      {...listeners}
+      title={title}
+      style={{
+        ...style,
+        opacity: isDragging ? 0.6 : 1,
+        transform: transform ? `translate3d(${transform.x}px, ${transform.y}px, 0)` : undefined,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function DropArea({ id, children, style }) {
+  const { setNodeRef, isOver } = useDroppable({ id });
+  return (
+    <div ref={setNodeRef} style={{ ...style, outline: isOver ? "2px solid #f97316" : style?.outline }}>
+      {children}
+    </div>
+  );
+}
+
+export default function App() {
+  const [mode, setMode] = useState("week");
+  const [screen, setScreen] = useState("board");
+  const [baseDate, setBaseDate] = useState(new Date());
+  const [poolDay, setPoolDay] = useState(getLocalDateKey(new Date()));
+
+  const [sites, setSites] = useState([]);
+  const [workers, setWorkers] = useState([]);
+  const [trucks, setTrucks] = useState([]);
+  const [assignments, setAssignments] = useState([]);
+  const [phases, setPhases] = useState([]);
+  const [siteDays, setSiteDays] = useState([]);
+
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const [masterType, setMasterType] = useState("sites");
+  const [siteDraft, setSiteDraft] = useState({
+    customer_name: "",
+    site_name: "",
+    address: "",
+    memo: "",
+    has_safety_docs: false,
+  });
+  const [truckDraft, setTruckDraft] = useState({
+    name: "",
+    plateNo: "",
+    etcNo: "",
+    owner: "",
+    type: "",
+  });
+  const [workerDraft, setWorkerDraft] = useState({
+    name: "",
+  });
+  const [siteNoteDrafts, setSiteNoteDrafts] = useState({});
+  const [editingSiteNoteKey, setEditingSiteNoteKey] = useState("");
+  const suppressNoteBlurSaveRef = useRef(false);
+
+  const assignmentRules = {
+    allowMultiSitePerDay: false,
+    allowMultiWorkerPerDay: false,
+    allowMultiTruckPerDay: false,
+  };
+
+  const days = useMemo(() => makeDays(baseDate, mode), [baseDate, mode]);
+  const todayKey = getLocalDateKey(new Date());
+
+  async function loadMasters(opts = {}) {
+    const { setBusy = true } = opts;
+    if (setBusy) setLoading(true);
+    setError("");
+    try {
+      const [siteSnap, workerSnap, truckSnap, phaseSnap] = await Promise.all([
+        getDocs(collection(db, "sites")),
+        getDocs(collection(db, "workers")),
+        getDocs(collection(db, "trucks")),
+        getDocs(collection(db, "site_phases")),
+      ]);
+      setSites(siteSnap.docs.map((d) => normalizeMaster({ id: d.id, ...d.data() })));
+      setWorkers(workerSnap.docs.map((d) => normalizeMaster({ id: d.id, ...d.data() })));
+      setTrucks(truckSnap.docs.map((d) => normalizeMaster({ id: d.id, ...d.data() })));
+      setPhases(phaseSnap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      if (setBusy) setLoading(false);
+    }
+  }
+
+  async function loadBoardData(dateKeys, opts = {}) {
+    const { setBusy = true } = opts;
+    if (!dateKeys || dateKeys.length === 0) return;
+    const sorted = [...dateKeys].sort();
+    const from = sorted[0];
+    const to = sorted[sorted.length - 1];
+
+    if (setBusy) setLoading(true);
+    setError("");
+    try {
+      const assignQ = query(collection(db, "assignments"), where("date", ">=", from), where("date", "<=", to));
+      const siteDayQ = query(collection(db, "site_days"), where("date", ">=", from), where("date", "<=", to));
+      const [assignSnap, siteDaySnap] = await Promise.all([getDocs(assignQ), getDocs(siteDayQ)]);
+      setAssignments(assignSnap.docs.map((d) => normalizeAssignment({ id: d.id, ...d.data() })));
+      setSiteDays(siteDaySnap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      if (setBusy) setLoading(false);
+    }
+  }
+
+  async function reloadAssignments(dateKeys, opts = {}) {
+    const { setBusy = true } = opts;
+    if (!dateKeys || dateKeys.length === 0) return;
+    const sorted = [...dateKeys].sort();
+    const from = sorted[0];
+    const to = sorted[sorted.length - 1];
+
+    if (setBusy) setLoading(true);
+    try {
+      const assignQ = query(collection(db, "assignments"), where("date", ">=", from), where("date", "<=", to));
+      const assignSnap = await getDocs(assignQ);
+      setAssignments(assignSnap.docs.map((d) => normalizeAssignment({ id: d.id, ...d.data() })));
+    } finally {
+      if (setBusy) setLoading(false);
+    }
+  }
+
+  async function reloadSiteDays(dateKeys, opts = {}) {
+    const { setBusy = true } = opts;
+    if (!dateKeys || dateKeys.length === 0) return;
+    const sorted = [...dateKeys].sort();
+    const from = sorted[0];
+    const to = sorted[sorted.length - 1];
+
+    if (setBusy) setLoading(true);
+    try {
+      const siteDayQ = query(collection(db, "site_days"), where("date", ">=", from), where("date", "<=", to));
+      const siteDaySnap = await getDocs(siteDayQ);
+      setSiteDays(siteDaySnap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    } finally {
+      if (setBusy) setLoading(false);
+    }
+  }
+
+  async function reloadMasters(opts = {}) {
+    return loadMasters(opts);
+  }
+
+  useEffect(() => {
+    loadMasters();
+  }, []);
+
+  useEffect(() => {
+    loadBoardData(days);
+  }, [days]);
+
+  const activeSites = sites.filter((x) => x.active);
+  const activeWorkers = workers.filter((x) => x.active);
+  const activeTrucks = trucks.filter((x) => x.active);
+
+  const teamSlots = useMemo(() => {
+    const map = new Map();
+    for (const a of assignments) {
+      if (!a.date || !a.team_id) continue;
+      const key = `${a.date}__${a.team_id}`;
+      if (!map.has(key)) {
+        map.set(key, { date: a.date, team_id: a.team_id, workerRows: [], truckRows: [], siteRows: [] });
+      }
+      const slot = map.get(key);
+      if (a.worker_id) slot.workerRows.push(a);
+      if (a.truck_id) slot.truckRows.push(a);
+      if (a.site_id) slot.siteRows.push(a);
+    }
+
+    for (const slot of map.values()) {
+      slot.siteRows.sort((a, b) => a.site_order - b.site_order);
+    }
+
+    return Array.from(map.values()).sort((a, b) => a.team_id.localeCompare(b.team_id, "ja"));
+  }, [assignments]);
+
+  function getDaySlots(day) {
+    return teamSlots.filter((s) => s.date === day);
+  }
+
+  function assignedIdsForDay(day, kind) {
+    const set = new Set();
+    assignments.forEach((a) => {
+      if (a.date !== day) return;
+      if (kind === "worker" && a.worker_id) set.add(a.worker_id);
+      if (kind === "truck" && a.truck_id) set.add(a.truck_id);
+      if (kind === "site" && a.site_id) set.add(a.site_id);
+    });
+    return set;
+  }
+
+  function unassignedForDay(day, kind) {
+    const used = assignedIdsForDay(day, kind);
+    if (kind === "worker") return activeWorkers.filter((w) => !used.has(w.id));
+    if (kind === "truck") return activeTrucks.filter((t) => !used.has(t.id));
+    return activeSites.filter((s) => !used.has(s.id));
+  }
+
+  const unassignedWorkers = useMemo(() => unassignedForDay(poolDay, "worker"), [poolDay, activeWorkers, assignments]);
+  const unassignedTrucks = useMemo(() => unassignedForDay(poolDay, "truck"), [poolDay, activeTrucks, assignments]);
+  const unassignedSites = useMemo(() => unassignedForDay(poolDay, "site"), [poolDay, activeSites, assignments]);
+
+  async function ensureTeamSlot(day, teamId) {
+    const slot = assignments.find((a) => a.date === day && a.team_id === teamId);
+    if (slot) return;
+    await addDoc(collection(db, "assignments"), { date: day, team_id: teamId, marker: "team_slot" });
+  }
+
+  function hasDuplicateForDay(payload) {
+    return assignments.some((a) => {
+      if (a.date !== payload.date) return false;
+      if (payload.worker_id && !assignmentRules.allowMultiWorkerPerDay && a.worker_id === payload.worker_id) return true;
+      if (payload.truck_id && !assignmentRules.allowMultiTruckPerDay && a.truck_id === payload.truck_id) return true;
+      if (payload.site_id && !assignmentRules.allowMultiSitePerDay && a.site_id === payload.site_id) return true;
+      return false;
+    });
+  }
+
+  async function addAssignmentRow(payload) {
+    try {
+      setError("");
+      setMessage("");
+      setLoading(true);
+
+      const duplicate = hasDuplicateForDay(payload);
+      if (duplicate) {
+        setMessage("重複のため配備できませんでした。");
+        return;
+      }
+
+      await ensureTeamSlot(payload.date, payload.team_id);
+      await addDoc(collection(db, "assignments"), payload);
+      setMessage("配備しました。");
+      await reloadAssignments(days, { setBusy: false });
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function moveRow(rowId, day, teamId) {
+    try {
+      setLoading(true);
+      await ensureTeamSlot(day, teamId);
+      await updateDoc(doc(db, "assignments", rowId), { date: day, team_id: teamId });
+      await reloadAssignments(days, { setBusy: false });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function unassignRow(rowId) {
+    try {
+      setLoading(true);
+      await deleteDoc(doc(db, "assignments", rowId));
+      await reloadAssignments(days, { setBusy: false });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function removeSiteAssignment(rowId) {
+    try {
+      setLoading(true);
+      await deleteDoc(doc(db, "assignments", rowId));
+      setMessage("現場配備を解除しました。");
+      await reloadAssignments(days, { setBusy: false });
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+
+  function getSiteDay(date, siteId) {
+    return siteDays.find((x) => x.date === date && x.site_id === siteId);
+  }
+
+  async function setSiteDayPhase(date, siteId, phaseType) {
+    const existing = getSiteDay(date, siteId);
+    try {
+      setLoading(true);
+      if (existing?.id) {
+        await updateDoc(doc(db, "site_days", existing.id), { phase_type: phaseType });
+      } else {
+        await addDoc(collection(db, "site_days"), { date, site_id: siteId, phase_type: phaseType, note: "" });
+      }
+      await reloadSiteDays(days, { setBusy: false });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function setSiteDayNote(date, siteId, note) {
+    const existing = getSiteDay(date, siteId);
+    try {
+      setLoading(true);
+      const nextNote = String(note || "").trim();
+      if (existing?.id) {
+        await updateDoc(doc(db, "site_days", existing.id), { note: nextNote });
+      } else {
+        await addDoc(collection(db, "site_days"), { date, site_id: siteId, phase_type: "", note: nextNote });
+      }
+      await reloadSiteDays(days, { setBusy: false });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function updateSiteTime(rowId, patch) {
+    try {
+      setLoading(true);
+      const next = { ...patch };
+      if (Object.prototype.hasOwnProperty.call(next, "planned_in")) next.planned_in = roundTimeTo5(next.planned_in);
+      if (Object.prototype.hasOwnProperty.call(next, "actual_in")) next.actual_in = roundTimeTo5(next.actual_in);
+      if (Object.prototype.hasOwnProperty.call(next, "actual_out")) next.actual_out = roundTimeTo5(next.actual_out);
+      await updateDoc(doc(db, "assignments", rowId), next);
+      await reloadAssignments(days, { setBusy: false });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function updateSiteStatus(rowId, status) {
+    const patch = { status };
+    if (status === "complete") patch.done_at = new Date().toISOString();
+    else patch.done_at = "";
+    try {
+      setLoading(true);
+      await updateDoc(doc(db, "assignments", rowId), patch);
+      await reloadAssignments(days, { setBusy: false });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function reorderSiteRows(day, teamId, draggedId, targetId) {
+    const slot = getDaySlots(day).find((s) => s.team_id === teamId);
+    if (!slot) return;
+    const rows = [...slot.siteRows];
+    const from = rows.findIndex((r) => r.id === draggedId);
+    const to = rows.findIndex((r) => r.id === targetId);
+    if (from < 0 || to < 0 || from === to) return;
+
+    const [moved] = rows.splice(from, 1);
+    rows.splice(to, 0, moved);
+
+    try {
+      setLoading(true);
+      await Promise.all(rows.map((r, i) => updateDoc(doc(db, "assignments", r.id), { site_order: i + 1 })));
+      await reloadAssignments(days, { setBusy: false });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function nextTeamIdForDay(day) {
+    const nums = getDaySlots(day)
+      .map((s) => {
+        const m = String(s.team_id || "").match(/^班(\d+)$/);
+        return m ? Number(m[1]) : 0;
+      })
+      .filter((n) => Number.isFinite(n));
+    const max = nums.length ? Math.max(...nums) : 0;
+    return `班${max + 1}`;
+  }
+
+  async function createTeamForDay(day) {
+    const teamId = nextTeamIdForDay(day);
+    await ensureTeamSlot(day, teamId);
+    await reloadAssignments(days, { setBusy: false });
+  }
+
+  async function deleteTeam(day, teamId) {
+    try {
+      const ok = window.confirm(`${teamId} を削除しますか？\n所属している現場・職人・トラックは未割当に戻ります。`);
+      if (!ok) return;
+      setLoading(true);
+      const rows = assignments.filter((a) => a.date === day && a.team_id === teamId);
+      await Promise.all(rows.map((r) => deleteDoc(doc(db, "assignments", r.id))));
+      setMessage(`${teamId} を削除しました。`);
+      await reloadAssignments(days, { setBusy: false });
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function toggleArchive(kind, id, active) {
+    await updateDoc(doc(db, kind, id), { active: !active });
+    await reloadMasters({ setBusy: false });
+  }
+
+  async function allocateCode(counterKey, format) {
+    const ref = doc(db, "counters", counterKey);
+    return runTransaction(db, async (tx) => {
+      const snap = await tx.get(ref);
+      const next = (snap.exists() ? Number(snap.data().next || 1) : 1);
+      tx.set(ref, { next: next + 1 });
+      return format(next);
+    });
+  }
+
+  async function addMasterRow() {
+    try {
+      setLoading(true);
+      if (masterType === "sites") {
+        if (!siteDraft.site_name.trim() || !siteDraft.customer_name.trim()) { setError("現場は customer_name と site_name が必須です"); return; }
+        const site_number = await allocateCode("sites_next", (n) => String(n).padStart(5, "0"));
+        await addDoc(collection(db, "sites"), {
+          site_number,
+          customer_name: siteDraft.customer_name.trim(),
+          site_name: siteDraft.site_name.trim(),
+          address: siteDraft.address.trim(),
+          memo: siteDraft.memo.trim(),
+          has_safety_docs: !!siteDraft.has_safety_docs,
+          name: siteDraft.site_name.trim(),
+          active: true,
+        });
+        setSiteDraft({ customer_name: "", site_name: "", address: "", memo: "", has_safety_docs: false });
+      } else if (masterType === "trucks") {
+        if (!truckDraft.name.trim()) return;
+        const vehicle_code = await allocateCode("vehicles_next", (n) => `T${String(n).padStart(3, "0")}`);
+        await addDoc(collection(db, "trucks"), {
+          vehicle_code,
+          name: truckDraft.name.trim(),
+          plateNo: truckDraft.plateNo.trim(),
+          etcNo: truckDraft.etcNo.trim(),
+          owner: truckDraft.owner.trim(),
+          type: truckDraft.type.trim(),
+          active: true,
+        });
+        setTruckDraft({ name: "", plateNo: "", etcNo: "", owner: "", type: "" });
+      } else {
+        if (!workerDraft.name.trim()) return;
+        const worker_code = await allocateCode("workers_next", (n) => `W${String(n).padStart(3, "0")}`);
+        await addDoc(collection(db, "workers"), {
+          worker_code,
+          name: workerDraft.name.trim(),
+          active: true,
+        });
+        setWorkerDraft({ name: "" });
+      }
+      await reloadMasters({ setBusy: false });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function parseActiveId(id) {
+    const raw = String(id || "");
+    const [kind, p1, p2] = raw.split(":");
+    if (kind === "poolWorker") return { type: "poolWorker", workerId: p1 };
+    if (kind === "poolTruck") return { type: "poolTruck", truckId: p1 };
+    if (kind === "poolSite") return { type: "poolSite", siteId: p1 };
+    if (kind === "dayWorker") return { type: "dayWorker", date: p1, workerId: p2 };
+    if (kind === "dayTruck") return { type: "dayTruck", date: p1, truckId: p2 };
+    if (kind === "rowWorker") return { type: "rowWorker", rowId: p1, workerId: p2 };
+    if (kind === "rowTruck") return { type: "rowTruck", rowId: p1, truckId: p2 };
+    if (kind === "rowSite") return { type: "rowSite", rowId: p1, siteId: p2 };
+    return null;
+  }
+
+  function parseDropId(id) {
+    const raw = String(id || "");
+    const [kind, date, teamId, rowId] = raw.split(":");
+    if (kind === "teamWorker") return { type: "teamWorker", date, teamId };
+    if (kind === "teamTruck") return { type: "teamTruck", date, teamId };
+    if (kind === "teamSite") return { type: "teamSite", date, teamId };
+    if (kind === "sitePos") return { type: "sitePos", date, teamId, rowId };
+    if (kind === "unassignWorker") return { type: "unassignWorker", date };
+    if (kind === "unassignTruck") return { type: "unassignTruck", date };
+    if (kind === "unassignSite") return { type: "unassignSite", date };
+    return null;
+  }
+
+  async function onDragEnd(e) {
+    const active = parseActiveId(e.active?.id);
+    const over = parseDropId(e.over?.id);
+    if (!active || !over) return;
+
+    if (active.type === "poolWorker" && over.type === "teamWorker") return addAssignmentRow({ date: over.date, team_id: over.teamId, worker_id: active.workerId });
+    if (active.type === "poolTruck" && over.type === "teamTruck") return addAssignmentRow({ date: over.date, team_id: over.teamId, truck_id: active.truckId });
+    if (active.type === "poolSite" && over.type === "teamSite") return addAssignmentRow({ date: over.date, team_id: over.teamId, site_id: active.siteId, site_order: 999999 });
+
+    if (active.type === "dayWorker" && over.type === "teamWorker") return addAssignmentRow({ date: over.date, team_id: over.teamId, worker_id: active.workerId });
+    if (active.type === "dayTruck" && over.type === "teamTruck") return addAssignmentRow({ date: over.date, team_id: over.teamId, truck_id: active.truckId });
+
+    if (active.type === "rowWorker" && over.type === "teamWorker") return moveRow(active.rowId, over.date, over.teamId);
+    if (active.type === "rowTruck" && over.type === "teamTruck") return moveRow(active.rowId, over.date, over.teamId);
+
+    if (active.type === "rowSite" && over.type === "sitePos") {
+      const source = assignments.find((a) => a.id === active.rowId);
+      if (source && source.date === over.date && source.team_id === over.teamId) {
+        return reorderSiteRows(over.date, over.teamId, active.rowId, over.rowId);
+      }
+      return moveRow(active.rowId, over.date, over.teamId);
+    }
+    if (active.type === "rowSite" && over.type === "teamSite") return moveRow(active.rowId, over.date, over.teamId);
+
+    if (active.type === "rowWorker" && over.type === "unassignWorker") return unassignRow(active.rowId);
+    if (active.type === "rowTruck" && over.type === "unassignTruck") return unassignRow(active.rowId);
+    if (active.type === "rowSite" && over.type === "unassignSite") return unassignRow(active.rowId);
+  }
+
+  const chip = {
+    fontSize: 12,
+    padding: "5px 8px",
+    borderRadius: 999,
+    border: "1px solid #d1d5db",
+    background: "#fff",
+    marginRight: 6,
+    marginBottom: 6,
+  };
+
+  const monthCells = useMemo(() => {
+    const firstMonth = new Date(baseDate.getFullYear(), baseDate.getMonth(), 1).getMonth();
+    return days.map((d) => {
+      const [, m, day] = d.split("-").map(Number);
+      return { key: d, inMonth: m - 1 === firstMonth, day, m };
+    });
+  }, [days, baseDate]);
+
+  return (
+    <DndContext onDragEnd={onDragEnd}>
+      <div style={{ padding: 16, fontFamily: "sans-serif" }}>
+        <h1>現場ホワイトボードシステム（Phase 1 Produced by Madoka with ChatGPT）</h1>
+
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <button onClick={() => setScreen("board")}>配備ボード</button>
+          <button onClick={() => setScreen("master")}>マスター管理</button>
+        </div>
+
+        {error && <div style={{ background: "#fee2e2", padding: 8, borderRadius: 6 }}>エラー: {error}</div>}
+        {message && <div style={{ background: "#e0f2fe", padding: 8, borderRadius: 6 }}>{message}</div>}
+        {loading && <div style={{ fontSize: 12, color: "#6b7280" }}>保存中...</div>}
+
+        {screen === "master" && (
+          <div style={{ marginTop: 12 }}>
+            <h2>マスター管理</h2>
+            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+              <button onClick={() => setMasterType("sites")}>現場</button>
+              <button onClick={() => setMasterType("workers")}>職人</button>
+              <button onClick={() => setMasterType("trucks")}>トラック</button>
+            </div>
+            {masterType === "sites" && (
+              <div style={{ display: "grid", gap: 8, marginBottom: 12, maxWidth: 520 }}>
+                <input value={siteDraft.customer_name} onChange={(e) => setSiteDraft({ ...siteDraft, customer_name: e.target.value })} placeholder="customer_name" />
+                <input value={siteDraft.site_name} onChange={(e) => setSiteDraft({ ...siteDraft, site_name: e.target.value })} placeholder="site_name" />
+                <input value={siteDraft.address} onChange={(e) => setSiteDraft({ ...siteDraft, address: e.target.value })} placeholder="address" />
+                <input value={siteDraft.memo} onChange={(e) => setSiteDraft({ ...siteDraft, memo: e.target.value })} placeholder="memo (短いメモ)" />
+                <label style={{ fontSize: 12 }}><input type="checkbox" checked={siteDraft.has_safety_docs} onChange={(e) => setSiteDraft({ ...siteDraft, has_safety_docs: e.target.checked })} /> 安全書類あり</label>
+                <button onClick={addMasterRow}>現場を追加（site_number自動採番）</button>
+              </div>
+            )}
+            {masterType === "trucks" && (
+              <div style={{ display: "grid", gap: 8, marginBottom: 12, maxWidth: 520 }}>
+                <input value={truckDraft.name} onChange={(e) => setTruckDraft({ ...truckDraft, name: e.target.value })} placeholder="name" />
+                <input value={truckDraft.plateNo} onChange={(e) => setTruckDraft({ ...truckDraft, plateNo: e.target.value })} placeholder="plateNo" />
+                <input value={truckDraft.etcNo} onChange={(e) => setTruckDraft({ ...truckDraft, etcNo: e.target.value })} placeholder="etcNo" />
+                <input value={truckDraft.owner} onChange={(e) => setTruckDraft({ ...truckDraft, owner: e.target.value })} placeholder="owner" />
+                <input value={truckDraft.type} onChange={(e) => setTruckDraft({ ...truckDraft, type: e.target.value })} placeholder="type" />
+                <button onClick={addMasterRow}>車両を追加（vehicle_code自動採番）</button>
+              </div>
+            )}
+            {masterType === "workers" && (
+              <div style={{ display: "grid", gap: 8, marginBottom: 12, maxWidth: 520 }}>
+                <input value={workerDraft.name} onChange={(e) => setWorkerDraft({ ...workerDraft, name: e.target.value })} placeholder="name" />
+                <button onClick={addMasterRow}>職人を追加（worker_code自動採番）</button>
+              </div>
+            )}
+            {(masterType === "sites" ? sites : masterType === "workers" ? workers : trucks).map((x) => (
+              <div key={x.id} style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+                <span style={{ minWidth: 360 }}>
+                  {masterType === "sites" ? `${x.site_number || ""} ${x.customer_name || ""} ${x.site_name || x.name || x.id}` : masterType === "workers" ? `${x.worker_code || ""} ${x.name || x.id}` : `${x.vehicle_code || ""} ${x.name || x.id} ${x.plateNo || ""}`}
+                </span>
+                <button onClick={() => toggleArchive(masterType, x.id, x.active)}>{x.active ? "アーカイブ" : "再有効化"}</button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {screen === "board" && (
+          <>
+            <div style={{ marginTop: 12, marginBottom: 10 }}>
+              <button onClick={() => setMode("week")}>1週間</button>
+              <button onClick={() => setMode("twoWeeks")} style={{ marginLeft: 6 }}>2週間</button>
+              <button onClick={() => setMode("month")} style={{ marginLeft: 6 }}>1ヶ月</button>
+              <button style={{ marginLeft: 10 }} onClick={() => { const d = new Date(baseDate); d.setDate(d.getDate() - (mode === "week" ? 7 : mode === "twoWeeks" ? 14 : 30)); setBaseDate(d); }}>←</button>
+              <button onClick={() => setBaseDate(new Date())}>今日</button>
+              <button onClick={() => { const d = new Date(baseDate); d.setDate(d.getDate() + (mode === "week" ? 7 : mode === "twoWeeks" ? 14 : 30)); setBaseDate(d); }}>→</button>
+            </div>
+
+            {(mode === "week" || mode === "twoWeeks") && (
+              <>
+                <div style={{ marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+                  <span>共有未割当プール基準日</span>
+                  <input type="date" value={poolDay} onChange={(e) => setPoolDay(e.target.value)} />
+                </div>
+
+                <div style={{ background: "#f3f4f6", borderRadius: 8, padding: 8, marginBottom: 8 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 4 }}>未割当 職人（共有）</div>
+                  <DropArea id={`unassignWorker:${poolDay}:_`} style={{ minHeight: 40 }}>
+                    {unassignedWorkers.map((w) => (
+                      <DraggableChip key={w.id} id={`poolWorker:${w.id}`} style={chip}>👷 {w.name || w.id}</DraggableChip>
+                    ))}
+                  </DropArea>
+                </div>
+
+                <div style={{ background: "#f3f4f6", borderRadius: 8, padding: 8, marginBottom: 8 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 4 }}>未割当 トラック（共有）</div>
+                  <DropArea id={`unassignTruck:${poolDay}:_`} style={{ minHeight: 40 }}>
+                    {unassignedTrucks.map((t) => (
+                      <DraggableChip key={t.id} id={`poolTruck:${t.id}`} style={chip}>🚚 {t.name || t.id}</DraggableChip>
+                    ))}
+                  </DropArea>
+                </div>
+
+                <div style={{ background: "#f3f4f6", borderRadius: 8, padding: 8, marginBottom: 16 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 4 }}>未割当 現場（共有）</div>
+                  <DropArea id={`unassignSite:${poolDay}:_`} style={{ minHeight: 40 }}>
+                    {unassignedSites.map((site) => (
+                      <DraggableChip key={site.id} id={`poolSite:${site.id}`} style={chip}>🏗 {site.name || site.id}</DraggableChip>
+                    ))}
+                  </DropArea>
+                </div>
+
+                <div style={{ display: "flex", gap: 10, overflowX: "auto", border: "2px solid #111", padding: 8 }}>
+                  {days.map((day) => {
+                    const slots = getDaySlots(day);
+                    const dailyUnassignedWorkers = unassignedForDay(day, "worker");
+                    const dailyUnassignedTrucks = unassignedForDay(day, "truck");
+                    return (
+                      <div key={day} style={{ minWidth: 320, background: day === todayKey ? "#eff6ff" : "#fafafa", padding: 8, borderRadius: 8 }}>
+                        <div style={{ fontWeight: 700, marginBottom: 8 }}>📅 {day}</div>
+
+                        <div style={{ background: "#eef2f7", borderRadius: 8, padding: 6, marginBottom: 8 }}>
+                          <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4 }}>日別未割当（見える化）</div>
+                          <div style={{ fontSize: 11, marginBottom: 3 }}>職人:</div>
+                          <div style={{ marginBottom: 4 }}>
+                            {dailyUnassignedWorkers.length === 0 ? <span style={{ fontSize: 11, color: "#6b7280" }}>なし</span> : dailyUnassignedWorkers.map((w) => (
+                              <DraggableChip key={`dw-${day}-${w.id}`} id={`dayWorker:${day}:${w.id}`} style={chip}>👷 {w.name || w.id}</DraggableChip>
+                            ))}
+                          </div>
+                          <div style={{ fontSize: 11, marginBottom: 3 }}>トラック:</div>
+                          <div>
+                            {dailyUnassignedTrucks.length === 0 ? <span style={{ fontSize: 11, color: "#6b7280" }}>なし</span> : dailyUnassignedTrucks.map((t) => (
+                              <DraggableChip key={`dt-${day}-${t.id}`} id={`dayTruck:${day}:${t.id}`} style={chip}>🚚 {t.name || t.id}</DraggableChip>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                          <button onClick={() => createTeamForDay(day)}>班作成</button>
+                        </div>
+
+                        {slots.map((slot) => {
+                          const workerRows = slot.workerRows;
+                          const truckRows = slot.truckRows;
+                          const siteRows = slot.siteRows;
+                          return (
+                            <div key={`${day}-${slot.team_id}`} style={{ background: "#fff", border: "1px solid #d1d5db", borderRadius: 8, padding: 8, marginBottom: 8 }}>
+                              <div style={{ fontWeight: 700, marginBottom: 6, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                <span>班: {slot.team_id}</span>
+                                <button type="button" onClick={() => deleteTeam(day, slot.team_id)} style={{ fontSize: 12, background: "#fee2e2", border: "1px solid #fca5a5", borderRadius: 6, padding: "4px 8px" }}>削除</button>
+                              </div>
+
+                              <DropArea id={`teamSite:${day}:${slot.team_id}`} style={{ minHeight: 44, borderTop: "1px dashed #d1d5db", paddingTop: 6, marginBottom: 6 }}>
+                                <div style={{ fontSize: 12, marginBottom: 4, fontWeight: 700 }}>現場（縦順）</div>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                                  {siteRows.map((r) => {
+                                    const site = activeSites.find((s) => s.id === r.site_id) || sites.find((s) => s.id === r.site_id);
+                                    const dayPhase = getSiteDay(day, r.site_id);
+                                    return (
+                                      <DropArea key={r.id} id={`sitePos:${day}:${slot.team_id}:${r.id}`} style={{ padding: 0 }}>
+                                        <div style={{ border: "1px solid #fcd34d", borderRadius: 8, background: "#fffdf5", padding: 6 }}>
+                                          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                                            <DraggableChip id={`rowSite:${r.id}:${r.site_id}`} style={{ ...chip, display: "inline-block", marginBottom: 0 }}>
+                                              移動
+                                            </DraggableChip>
+                                            <button
+                                              type="button"
+                                              style={{ fontSize: 10, background: "#fee2e2", border: "1px solid #fca5a5", borderRadius: 6, padding: "2px 6px" }}
+                                              onClick={() => removeSiteAssignment(r.id)}
+                                              title="この日・この班から現場を外す"
+                                            >
+                                              削除
+                                            </button>
+                                          </div>
+
+                                          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                                            <span style={{ width: 10, height: 10, borderRadius: 999, background: phaseColor(dayPhase?.phase_type), display: "inline-block" }} />
+                                            <strong style={{ fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                              {[site?.site_number, site?.customer_name, site?.site_name].filter(Boolean).join(" ") || site?.name || r.site_id}
+                                            </strong>
+                                            <span style={{ fontSize: 10, color: "#6b7280", marginLeft: "auto" }}>{site?.address || ""}{site?.memo ? `  📝 ${String(site.memo).slice(0, 24)}` : ""}</span>
+                                          </div>
+
+                                          <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 4 }}>
+                                            <span style={{ fontSize: 11, color: "#374151" }}>💬 {String(dayPhase?.note || "").slice(0, 28) || "（日別メモなし）"}</span>
+                                            <button
+                                              type="button"
+                                              style={{ fontSize: 10 }}
+                                              onClick={() => {
+                                                const k = `${day}_${r.site_id}`;
+                                                setEditingSiteNoteKey(k);
+                                                setSiteNoteDrafts({ ...siteNoteDrafts, [k]: dayPhase?.note || "" });
+                                              }}
+                                            >
+                                              編集
+                                            </button>
+                                          </div>
+
+                                          {editingSiteNoteKey === `${day}_${r.site_id}` && (
+                                            <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6 }}>
+                                              <input
+                                                value={siteNoteDrafts[`${day}_${r.site_id}`] ?? ""}
+                                                onChange={(e) => setSiteNoteDrafts({ ...siteNoteDrafts, [`${day}_${r.site_id}`]: e.target.value })}
+                                                onBlur={async () => {
+                                                  if (suppressNoteBlurSaveRef.current) {
+                                                    suppressNoteBlurSaveRef.current = false;
+                                                    return;
+                                                  }
+                                                  const k = `${day}_${r.site_id}`;
+                                                  await setSiteDayNote(day, r.site_id, siteNoteDrafts[k] || "");
+                                                }}
+                                                placeholder="日別コメント"
+                                                style={{ flex: 1, minWidth: 140 }}
+                                              />
+                                              <button
+                                                type="button"
+                                                style={{ fontSize: 10 }}
+                                                onMouseDown={() => {
+                                                  suppressNoteBlurSaveRef.current = true;
+                                                }}
+                                                onClick={async () => {
+                                                  const k = `${day}_${r.site_id}`;
+                                                  await setSiteDayNote(day, r.site_id, siteNoteDrafts[k] || "");
+                                                  setEditingSiteNoteKey("");
+                                                }}
+                                              >
+                                                保存
+                                              </button>
+                                            </div>
+                                          )}
+
+                                          <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                                            <label style={{ fontSize: 11 }}>工程
+                                              <select value={dayPhase?.phase_type || ""} onChange={(e) => setSiteDayPhase(day, r.site_id, e.target.value)}>
+                                                <option value="">未設定</option>
+                                                <option value="green">Lead</option>
+                                                <option value="blue">架</option>
+                                                <option value="yellow">追加</option>
+                                                <option value="red">払</option>
+                                              </select>
+                                            </label>
+                                            <label style={{ fontSize: 11 }}>予定 <input type="time" step={300} defaultValue={r.planned_in || ""} onBlur={(e) => updateSiteTime(r.id, { planned_in: e.target.value })} /></label>
+                                            <label style={{ fontSize: 11 }}>IN <input type="time" step={300} defaultValue={r.actual_in || ""} onBlur={(e) => updateSiteTime(r.id, { actual_in: e.target.value })} /></label>
+                                            <button type="button" style={{ fontSize: 11 }} onClick={() => updateSiteTime(r.id, { actual_in: nowTime() })}>IN</button>
+                                            <label style={{ fontSize: 11 }}>OUT <input type="time" step={300} defaultValue={r.actual_out || ""} onBlur={(e) => updateSiteTime(r.id, { actual_out: e.target.value })} /></label>
+                                            <button type="button" style={{ fontSize: 11 }} onClick={() => updateSiteTime(r.id, { actual_out: nowTime() })}>OUT</button>
+                                            <label style={{ fontSize: 11 }}>状態
+                                              <select value={r.status || "unset"} onChange={(e) => updateSiteStatus(r.id, e.target.value)}>
+                                                <option value="unset">unset</option>
+                                                <option value="incomplete">incomplete</option>
+                                                <option value="complete">complete</option>
+                                              </select>
+                                            </label>
+                                            <button type="button" style={{ fontSize: 11, fontWeight: 700 }} onClick={() => updateSiteStatus(r.id, "complete")}>COMPLETE</button>
+                                            {r.done_at ? <span style={{ fontSize: 10, color: "#6b7280" }}>done: {String(r.done_at).slice(0, 16).replace("T", " ")}</span> : null}
+                                          </div>
+                                        </div>
+                                      </DropArea>
+                                    );
+                                  })}
+                                </div>
+                              </DropArea>
+
+                              <DropArea id={`teamWorker:${day}:${slot.team_id}`} style={{ minHeight: 36, borderTop: "1px dashed #d1d5db", paddingTop: 6 }}>
+                                <div style={{ fontSize: 12, marginBottom: 4 }}>職人</div>
+                                {workerRows.map((r) => {
+                                  const w = activeWorkers.find((x) => x.id === r.worker_id);
+                                  return <DraggableChip key={r.id} id={`rowWorker:${r.id}:${r.worker_id}`} style={chip}>👷 {w?.name || r.worker_id}</DraggableChip>;
+                                })}
+                              </DropArea>
+
+                              <DropArea id={`teamTruck:${day}:${slot.team_id}`} style={{ minHeight: 36, borderTop: "1px dashed #d1d5db", paddingTop: 6, marginTop: 6 }}>
+                                <div style={{ fontSize: 12, marginBottom: 4 }}>トラック</div>
+                                {truckRows.map((r) => {
+                                  const t = activeTrucks.find((x) => x.id === r.truck_id);
+                                  return <DraggableChip key={r.id} id={`rowTruck:${r.id}:${r.truck_id}`} style={chip}>🚚 {t?.name || r.truck_id}</DraggableChip>;
+                                })}
+                              </DropArea>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+
+            {mode === "month" && (
+              <div>
+                <h2>月間ビュー（読み取り専用）</h2>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(120px,1fr))", gap: 6 }}>
+                  {monthCells.map((c) => {
+                    const daySites = assignments.filter((a) => a.date === c.key && a.site_id);
+                    const phaseBars = phases.filter((p) => p.start_date <= c.key && p.end_date >= c.key);
+                    return (
+                      <div key={c.key} style={{ minHeight: 90, border: "1px solid #ddd", background: c.inMonth ? "#fff" : "#f3f4f6", padding: 6 }}>
+                        <div style={{ fontWeight: 700, fontSize: 12 }}>{c.m}/{c.day}</div>
+                        {daySites.slice(0, 3).map((a) => {
+                          const site = activeSites.find((s) => s.id === a.site_id) || sites.find((s) => s.id === a.site_id);
+                          return <div key={a.id} style={{ fontSize: 11 }}>🏗 {site?.name || a.site_id}</div>;
+                        })}
+                        {phaseBars.slice(0, 2).map((p) => (
+                          <div key={p.id} style={{ fontSize: 10, background: "#fef3c7", marginTop: 2, borderRadius: 4, padding: "1px 4px" }}>{p.phase_type || "工程"}</div>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
+                <p style={{ color: "#6b7280", fontSize: 12 }}>※ 月間ビューは編集不可（ドラッグ＆ドロップ無効）</p>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </DndContext>
+  );
+}
